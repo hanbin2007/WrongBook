@@ -1,16 +1,16 @@
-// Wrongbook Web App - 精简版
+// Wrongbook Web App - LocalStorage Only
 // 功能：错题版+干净版 PDF 配对、框选错题、间隔重复复习（本地 LocalStorage）
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
 
 GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.js";
 
 const STORAGE_KEYS = {
-  documents: "wrongbook_documents_v1",
-  mistakes: "wrongbook_mistakes_v1",
-  reviews: "wrongbook_reviews_v1",
+  documents: "wrongbook_documents_v2",
+  mistakes: "wrongbook_mistakes_v2",
+  reviews: "wrongbook_reviews_v2",
 };
 
 function createId() {
@@ -110,50 +110,80 @@ function saveToStorage(key, value) {
   } catch {}
 }
 
+async function parsePdf(file) {
+  const fingerprint = await hashFile(file);
+  const url = URL.createObjectURL(file);
+  const pdf = await getDocument(url).promise;
+  const pageCount = pdf.numPages;
+  const pageSizes = [];
+  let baseWidth = 0;
+  let baseHeight = 0;
+
+  for (let i = 1; i <= pageCount; i += 1) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 1 });
+    pageSizes.push({ width: viewport.width, height: viewport.height });
+    if (i === 1) {
+      baseWidth = viewport.width;
+      baseHeight = viewport.height;
+    }
+  }
+
+  pdf.destroy();
+  return { fingerprint, url, pageCount, pageSizes, baseWidth, baseHeight };
+}
+
+function isPageSizeCompatible(baseSizes, candidateSizes, tolerance = 0.01) {
+  if (baseSizes.length !== candidateSizes.length) return false;
+  for (let i = 0; i < baseSizes.length; i += 1) {
+    const a = baseSizes[i];
+    const b = candidateSizes[i];
+    const widthDiff = Math.abs(a.width - b.width) / a.width;
+    const heightDiff = Math.abs(a.height - b.height) / a.height;
+    if (widthDiff > tolerance || heightDiff > tolerance) return false;
+  }
+  return true;
+}
+
 export default function App() {
-  const [documentMetas, setDocumentMetas] = useState([]);
+  const [documents, setDocuments] = useState([]);
   const [mistakes, setMistakes] = useState([]);
   const [reviewLogs, setReviewLogs] = useState([]);
   const [loadedDocs, setLoadedDocs] = useState([]);
-  const [view, setView] = useState("workspace"); // workspace | review | dashboard
+  const [view, setView] = useState("workspace");
   const [selectedPairId, setSelectedPairId] = useState("");
   const [selectedRole, setSelectedRole] = useState("with_handwriting");
   const [selectedPageIndex, setSelectedPageIndex] = useState(0);
   const [reviewIndex, setReviewIndex] = useState(0);
 
-  // init
   useEffect(() => {
-    setDocumentMetas(loadFromStorage(STORAGE_KEYS.documents, []));
+    setDocuments(loadFromStorage(STORAGE_KEYS.documents, []));
     setMistakes(loadFromStorage(STORAGE_KEYS.mistakes, []));
     setReviewLogs(loadFromStorage(STORAGE_KEYS.reviews, []));
   }, []);
 
-  useEffect(() => saveToStorage(STORAGE_KEYS.documents, documentMetas), [documentMetas]);
+  useEffect(() => saveToStorage(STORAGE_KEYS.documents, documents), [documents]);
   useEffect(() => saveToStorage(STORAGE_KEYS.mistakes, mistakes), [mistakes]);
   useEffect(() => saveToStorage(STORAGE_KEYS.reviews, reviewLogs), [reviewLogs]);
 
   const pairs = useMemo(() => {
     const map = new Map();
-    documentMetas.forEach((doc) => {
-      if (!map.has(doc.pairGroupId)) {
-        map.set(doc.pairGroupId, {
-          pairGroupId: doc.pairGroupId,
-          title: doc.title,
-          hasWith: doc.role === "with_handwriting",
-          hasClean: doc.role === "clean",
-        });
-      } else {
-        const ex = map.get(doc.pairGroupId);
-        map.set(doc.pairGroupId, {
-          pairGroupId: doc.pairGroupId,
-          title: ex.title || doc.title,
-          hasWith: ex.hasWith || doc.role === "with_handwriting",
-          hasClean: ex.hasClean || doc.role === "clean",
-        });
-      }
+    documents.forEach((doc) => {
+      const group = map.get(doc.pairGroupId) || {
+        pairGroupId: doc.pairGroupId,
+        title: doc.title,
+        hasWith: false,
+        hasClean: false,
+      };
+      map.set(doc.pairGroupId, {
+        pairGroupId: doc.pairGroupId,
+        title: group.title || doc.title,
+        hasWith: group.hasWith || doc.roleInPair === "with_handwriting",
+        hasClean: group.hasClean || doc.roleInPair === "clean",
+      });
     });
     return Array.from(map.values());
-  }, [documentMetas]);
+  }, [documents]);
 
   const currentPair = useMemo(
     () => pairs.find((p) => p.pairGroupId === selectedPairId) || null,
@@ -163,64 +193,84 @@ export default function App() {
   const currentWithMeta = useMemo(() => {
     if (!currentPair) return null;
     return (
-      documentMetas.find(
-        (d) => d.pairGroupId === currentPair.pairGroupId && d.role === "with_handwriting"
+      documents.find(
+        (d) => d.pairGroupId === currentPair.pairGroupId && d.roleInPair === "with_handwriting"
       ) || null
     );
-  }, [documentMetas, currentPair]);
+  }, [documents, currentPair]);
 
   const currentCleanMeta = useMemo(() => {
     if (!currentPair) return null;
     return (
-      documentMetas.find(
-        (d) => d.pairGroupId === currentPair.pairGroupId && d.role === "clean"
-      ) || null
+      documents.find((d) => d.pairGroupId === currentPair.pairGroupId && d.roleInPair === "clean") ||
+      null
     );
-  }, [documentMetas, currentPair]);
+  }, [documents, currentPair]);
 
-  const getLoadedDoc = (fingerprint, role) =>
-    loadedDocs.find((d) => d.fingerprint === fingerprint && d.role === role) || null;
+  const getLoadedDoc = (documentId) => loadedDocs.find((d) => d.documentId === documentId) || null;
 
-  // 上传错题版
-  const handleUploadWithHandwriting = async (file) => {
+  // 上传错题版，可新建或与已有干净版绑定
+  const handleUploadWithHandwriting = async (file, targetPairId = null) => {
     if (!file) return;
     try {
       if (!crypto?.subtle?.digest) {
         alert("当前环境不支持 crypto.subtle，请在 localhost 或 https 下运行。");
         return;
       }
+      const info = await parsePdf(file);
       const title = file.name.replace(/\.pdf$/i, "");
-      const fingerprint = await hashFile(file);
-      const url = URL.createObjectURL(file);
-      const pdf = await getDocument(url).promise;
-      const pageCount = pdf.numPages;
-      pdf.destroy();
 
-      let meta = documentMetas.find(
-        (d) => d.fingerprint === fingerprint && d.role === "with_handwriting"
-      );
-      let pairGroupId;
+      let pairGroupId = targetPairId || createId();
+      let counterpart = null;
 
-      if (!meta) {
-        pairGroupId = createId();
-        meta = { fingerprint, title, pageCount, pairGroupId, role: "with_handwriting" };
-        setDocumentMetas((prev) => [...prev, meta]);
-      } else {
-        pairGroupId = meta.pairGroupId;
-        setDocumentMetas((prev) =>
-          prev.map((d) =>
-            d.fingerprint === fingerprint && d.role === "with_handwriting"
-              ? { ...d, title, pageCount }
-              : d
-          )
+      if (targetPairId) {
+        counterpart = documents.find(
+          (d) => d.pairGroupId === targetPairId && d.roleInPair === "clean"
         );
+        if (counterpart) {
+          const compatible =
+            info.pageCount === counterpart.pageCount &&
+            isPageSizeCompatible(counterpart.pageSizes, info.pageSizes);
+          if (!compatible) {
+            URL.revokeObjectURL(info.url);
+            alert("这两份 PDF 排版不一致，无法绑定成一组。");
+            return;
+          }
+        }
       }
 
+      const existing = documents.find(
+        (d) => d.fingerprint === info.fingerprint && d.roleInPair === "with_handwriting"
+      );
+
+      const docMeta = {
+        id: existing?.id || createId(),
+        title: counterpart?.title ? `${counterpart.title}（错题版）` : title,
+        fingerprint: info.fingerprint,
+        pageCount: info.pageCount,
+        baseWidth: info.baseWidth,
+        baseHeight: info.baseHeight,
+        pageSizes: info.pageSizes,
+        pairGroupId,
+        roleInPair: "with_handwriting",
+        createdAt: existing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      setDocuments((prev) => {
+        const filtered = prev.filter((d) => d.id !== docMeta.id);
+        return [...filtered, docMeta];
+      });
+
       setLoadedDocs((prev) => [
-        ...prev.filter(
-          (d) => !(d.fingerprint === fingerprint && d.role === "with_handwriting")
-        ),
-        { fingerprint, role: "with_handwriting", file, url, pageCount },
+        ...prev.filter((d) => d.documentId !== docMeta.id),
+        {
+          documentId: docMeta.id,
+          roleInPair: "with_handwriting",
+          file,
+          url: info.url,
+          pageCount: info.pageCount,
+        },
       ]);
 
       setSelectedPairId(pairGroupId);
@@ -232,54 +282,92 @@ export default function App() {
     }
   };
 
-  // 上传干净版（与当前错题版配对）
-  const handleUploadClean = async (file) => {
-    if (!file || !currentWithMeta) return;
+  // 上传干净版，可新建或与已有错题版绑定
+  const handleUploadClean = async (file, targetPairId = null) => {
+    if (!file) return;
     try {
       if (!crypto?.subtle?.digest) {
         alert("当前环境不支持 crypto.subtle，请在 localhost 或 https 下运行。");
         return;
       }
-      const fingerprint = await hashFile(file);
-      const title = currentWithMeta.title + "（干净版）";
-      const url = URL.createObjectURL(file);
-      const pdf = await getDocument(url).promise;
-      const pageCount = pdf.numPages;
-      pdf.destroy();
+      const info = await parsePdf(file);
+      const title = file.name.replace(/\.pdf$/i, "");
 
-      if (pageCount !== currentWithMeta.pageCount) {
-        alert("干净版 PDF 页数与错题版不一致，无法绑定。");
-        URL.revokeObjectURL(url);
-        return;
+      let pairGroupId = targetPairId || createId();
+      let counterpart = null;
+
+      if (targetPairId) {
+        counterpart = documents.find(
+          (d) => d.pairGroupId === targetPairId && d.roleInPair === "with_handwriting"
+        );
+        if (counterpart) {
+          const compatible =
+            info.pageCount === counterpart.pageCount &&
+            isPageSizeCompatible(counterpart.pageSizes, info.pageSizes);
+          if (!compatible) {
+            URL.revokeObjectURL(info.url);
+            alert("这两份 PDF 排版不一致，无法绑定成一组。");
+            return;
+          }
+        }
       }
 
-      let meta = documentMetas.find(
-        (d) => d.fingerprint === fingerprint && d.role === "clean"
+      const existing = documents.find(
+        (d) => d.fingerprint === info.fingerprint && d.roleInPair === "clean"
       );
 
-      if (!meta) {
-        meta = {
-          fingerprint,
-          title,
-          pageCount,
-          pairGroupId: currentWithMeta.pairGroupId,
-          role: "clean",
-        };
-        setDocumentMetas((prev) => [...prev, meta]);
-      } else {
-        setDocumentMetas((prev) =>
-          prev.map((d) =>
-            d.fingerprint === fingerprint && d.role === "clean"
-              ? { ...d, title, pageCount, pairGroupId: currentWithMeta.pairGroupId }
-              : d
+      const docMeta = {
+        id: existing?.id || createId(),
+        title: counterpart?.title ? `${counterpart.title}（干净版）` : title,
+        fingerprint: info.fingerprint,
+        pageCount: info.pageCount,
+        baseWidth: info.baseWidth,
+        baseHeight: info.baseHeight,
+        pageSizes: info.pageSizes,
+        pairGroupId,
+        roleInPair: "clean",
+        createdAt: existing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      setDocuments((prev) => {
+        const filtered = prev.filter((d) => d.id !== docMeta.id);
+        return [...filtered, docMeta];
+      });
+
+      setLoadedDocs((prev) => [
+        ...prev.filter((d) => d.documentId !== docMeta.id),
+        {
+          documentId: docMeta.id,
+          roleInPair: "clean",
+          file,
+          url: info.url,
+          pageCount: info.pageCount,
+        },
+      ]);
+
+      // 如果与错题版绑定，自动补齐已有错题的 clean 信息
+      if (counterpart) {
+        setMistakes((prev) =>
+          prev.map((m) =>
+            m.pairGroupId === pairGroupId
+              ? {
+                  ...m,
+                  cleanDocumentId: docMeta.id,
+                  cleanPageIndex:
+                    typeof m.cleanPageIndex === "number"
+                      ? m.cleanPageIndex
+                      : m.originalPageIndex,
+                  snapshotCleanKey: m.snapshotCleanKey || null,
+                }
+              : m
           )
         );
       }
 
-      setLoadedDocs((prev) => [
-        ...prev.filter((d) => !(d.fingerprint === fingerprint && d.role === "clean")),
-        { fingerprint, role: "clean", file, url, pageCount },
-      ]);
+      setSelectedPairId(pairGroupId);
+      setSelectedRole(counterpart ? "with_handwriting" : "clean");
+      setSelectedPageIndex(0);
     } catch (e) {
       console.error(e);
       alert("上传干净版 PDF 时出错：" + (e?.message || e));
@@ -287,17 +375,20 @@ export default function App() {
   };
 
   const handleCreateMistake = (bbox) => {
-    if (!currentWithMeta) return;
+    if (!currentWithMeta || selectedRole !== "with_handwriting") return;
     const cleanMeta = currentCleanMeta || null;
     const now = new Date();
     const sched = scheduleInitial(now);
     const m = {
       id: createId(),
       pairGroupId: currentWithMeta.pairGroupId,
-      originalFingerprint: currentWithMeta.fingerprint,
-      cleanFingerprint: cleanMeta ? cleanMeta.fingerprint : null,
-      pageIndex: selectedPageIndex,
+      originalDocumentId: currentWithMeta.id,
+      originalPageIndex: selectedPageIndex,
+      cleanDocumentId: cleanMeta ? cleanMeta.id : null,
+      cleanPageIndex: cleanMeta ? selectedPageIndex : null,
       bbox,
+      snapshotOriginalKey: null,
+      snapshotCleanKey: cleanMeta ? null : null,
       title: "",
       note: "",
       tags: [],
@@ -343,9 +434,7 @@ export default function App() {
   const totalMistakeCount = mistakes.length;
   const dueCount = dueMistakes.length;
   const todayStr = new Date().toISOString().slice(0, 10);
-  const todayDoneCount = reviewLogs.filter(
-    (log) => (log.reviewedAt || "").slice(0, 10) === todayStr
-  ).length;
+  const todayDoneCount = reviewLogs.filter((log) => (log.reviewedAt || "").slice(0, 10) === todayStr).length;
 
   return (
     <div className="h-screen w-screen bg-slate-950 text-slate-50 flex flex-col">
@@ -371,7 +460,7 @@ export default function App() {
         {view === "workspace" && (
           <WorkspaceView
             pairs={pairs}
-            documentMetas={documentMetas}
+            documents={documents}
             loadedDocs={loadedDocs}
             onUploadWithHandwriting={handleUploadWithHandwriting}
             onUploadClean={handleUploadClean}
@@ -388,6 +477,7 @@ export default function App() {
             onUpdateMistakeMeta={handleUpdateMistakeMeta}
             onDeleteMistake={handleDeleteMistake}
             getLoadedDoc={getLoadedDoc}
+            mistakes={mistakes}
           />
         )}
         {view === "review" && (
@@ -396,16 +486,12 @@ export default function App() {
             index={reviewIndex}
             total={dueMistakes.length}
             onReview={handleReview}
-            documentMetas={documentMetas}
+            documents={documents}
             getLoadedDoc={getLoadedDoc}
           />
         )}
         {view === "dashboard" && (
-          <DashboardView
-            totalMistakeCount={totalMistakeCount}
-            dueCount={dueCount}
-            todayDoneCount={todayDoneCount}
-          />
+          <DashboardView totalMistakeCount={totalMistakeCount} dueCount={dueCount} todayDoneCount={todayDoneCount} />
         )}
       </div>
     </div>
@@ -430,7 +516,7 @@ function NavButton({ active, children, onClick }) {
 function WorkspaceView(props) {
   const {
     pairs,
-    documentMetas,
+    documents,
     loadedDocs,
     onUploadWithHandwriting,
     onUploadClean,
@@ -449,62 +535,66 @@ function WorkspaceView(props) {
     getLoadedDoc,
   } = props;
 
-  const handleWithFileChange = (e) => {
+  const handleWithFileChange = (e, pairId = null) => {
     const file = e.target.files?.[0];
     if (file) {
-      onUploadWithHandwriting(file);
+      onUploadWithHandwriting(file, pairId);
       e.target.value = "";
     }
   };
 
-  const handleCleanFileChange = (e) => {
+  const handleCleanFileChange = (e, pairId = null) => {
     const file = e.target.files?.[0];
     if (file) {
-      onUploadClean(file);
+      onUploadClean(file, pairId);
       e.target.value = "";
     }
   };
 
-  const selectedMeta =
-    selectedRole === "with_handwriting" ? currentWithMeta : currentCleanMeta;
-  const loadedDoc =
-    selectedMeta && getLoadedDoc(selectedMeta.fingerprint, selectedMeta.role);
+  const selectedMeta = selectedRole === "with_handwriting" ? currentWithMeta : currentCleanMeta;
+  const loadedDoc = selectedMeta && getLoadedDoc(selectedMeta.id);
   const pageCount = selectedMeta?.pageCount || 0;
 
   return (
     <div className="flex flex-1 min-h-0">
       <aside className="w-72 border-r border-slate-800 bg-slate-900/60 p-3 flex flex-col gap-3">
         <div>
-          <div className="text-xs font-semibold text-slate-300 mb-1">上传错题版 PDF</div>
+          <div className="text-xs font-semibold text-slate-300 mb-1">上传错题版 PDF（新建套卷）</div>
           <input
             type="file"
             accept="application/pdf"
-            onChange={handleWithFileChange}
+            onChange={(e) => handleWithFileChange(e, null)}
             className="block w-full text-xs text-slate-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-sky-600 file:text-xs file:text-white hover:file:bg-sky-500"
+          />
+        </div>
+        <div>
+          <div className="text-xs font-semibold text-slate-300 mb-1">上传干净版 PDF（新建套卷）</div>
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={(e) => handleCleanFileChange(e, null)}
+            className="block w-full text-xs text-slate-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-emerald-600 file:text-xs file:text-white hover:file:bg-emerald-500"
           />
         </div>
         <div>
           <div className="text-xs font-semibold text-slate-300 mb-1 flex items-center justify-between">
             <span>文档配对</span>
-            <span className="text-[10px] text-slate-500">先选错题版，再补充干净版</span>
+            <span className="text-[10px] text-slate-500">先选已上传的版本，再补充另一侧</span>
           </div>
           <div className="space-y-1 max-h-40 overflow-auto pr-1">
-            {pairs.length === 0 && (
-              <div className="text-xs text-slate-500">先上传一份错题版 PDF。</div>
-            )}
+            {pairs.length === 0 && <div className="text-xs text-slate-500">先上传一份 PDF。</div>}
             {pairs.map((p) => {
-              const withMeta = documentMetas.find(
-                (d) => d.pairGroupId === p.pairGroupId && d.role === "with_handwriting"
+              const withMeta = documents.find(
+                (d) => d.pairGroupId === p.pairGroupId && d.roleInPair === "with_handwriting"
               );
-              const pairMistakeCount = (props.mistakes || []).filter(
-                (m) => m.pairGroupId === p.pairGroupId
-              ).length;
+              const cleanMeta = documents.find((d) => d.pairGroupId === p.pairGroupId && d.roleInPair === "clean");
+              const pairMistakeCount = (props.mistakes || []).filter((m) => m.pairGroupId === p.pairGroupId).length;
               return (
                 <button
                   key={p.pairGroupId}
                   onClick={() => {
                     setSelectedPairId(p.pairGroupId);
-                    setSelectedRole("with_handwriting");
+                    setSelectedRole(withMeta ? "with_handwriting" : "clean");
                     setSelectedPageIndex(0);
                   }}
                   className={`w-full text-left px-2 py-1 rounded border text-xs flex flex-col gap-0.5 ${
@@ -514,12 +604,10 @@ function WorkspaceView(props) {
                   }`}
                 >
                   <span className="font-medium text-slate-100 truncate">
-                    {withMeta?.title || p.title || "未命名文档"}
+                    {withMeta?.title || cleanMeta?.title || p.title || "未命名文档"}
                   </span>
                   <span className="text-[10px] text-slate-400 flex justify-between">
-                    <span>
-                      {p.hasWith ? "错题版✓" : "错题版✗"} · {p.hasClean ? "干净版✓" : "干净版✗"}
-                    </span>
+                    <span>{p.hasWith ? "错题版✓" : "错题版✗"} · {p.hasClean ? "干净版✓" : "干净版✗"}</span>
                     <span>错题 {pairMistakeCount}</span>
                   </span>
                 </button>
@@ -527,17 +615,26 @@ function WorkspaceView(props) {
             })}
           </div>
         </div>
-        {currentWithMeta && (
+        {currentPair && (!currentCleanMeta || !currentWithMeta) && (
           <div>
             <div className="text-xs font-semibold text-slate-300 mb-1">
-              当前配对：{currentWithMeta.title}
+              {currentWithMeta ? "为当前套卷补充干净版" : "为当前套卷补充错题版"}
             </div>
-            <input
-              type="file"
-              accept="application/pdf"
-              onChange={handleCleanFileChange}
-              className="block w-full text-xs text-slate-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-emerald-600 file:text-xs file:text-white hover:file:bg-emerald-500"
-            />
+            {currentWithMeta ? (
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(e) => handleCleanFileChange(e, currentPair.pairGroupId)}
+                className="block w-full text-xs text-slate-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-emerald-600 file:text-xs file:text-white hover:file:bg-emerald-500"
+              />
+            ) : (
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(e) => handleWithFileChange(e, currentPair.pairGroupId)}
+                className="block w-full text-xs text-slate-300 file:mr-2 file:px-2 file:py-1 file:rounded file:border-0 file:bg-sky-600 file:text-xs file:text-white hover:file:bg-sky-500"
+              />
+            )}
           </div>
         )}
       </aside>
@@ -554,6 +651,7 @@ function WorkspaceView(props) {
                     : "border-slate-700 text-slate-300 hover:border-slate-500"
                 }`}
                 onClick={() => setSelectedRole("with_handwriting")}
+                disabled={!currentWithMeta}
               >
                 错题版
               </button>
@@ -589,25 +687,32 @@ function WorkspaceView(props) {
           </div>
 
           <div className="flex-1 flex items-center justify-center bg-slate-950 min-h-0">
-            {!selectedMeta && (
-              <div className="text-xs text-slate-500">
-                请先在左侧上传错题版 PDF，并选择一套卷子。
-              </div>
-            )}
+            {!selectedMeta && <div className="text-xs text-slate-500">请先在左侧上传 PDF 并选择一套卷子。</div>}
             {selectedMeta && !loadedDoc && (
-              <div className="text-xs text-slate-500">
-                当前 PDF 尚未加载，请在左侧重新上传对应版本。
-              </div>
+              <div className="text-xs text-slate-500">当前 PDF 尚未加载，请在左侧重新上传对应版本。</div>
             )}
             {selectedMeta && loadedDoc && (
               <PdfPageViewer
                 key={loadedDoc.url + "-" + selectedPageIndex}
                 fileUrl={loadedDoc.url}
-                pageIndex={selectedPageIndex}
+                pageIndex={
+                  selectedRole === "with_handwriting"
+                    ? selectedPageIndex
+                    : selectedMeta && typeof selectedPageIndex === "number"
+                    ? selectedPageIndex
+                    : 0
+                }
                 interactive={selectedRole === "with_handwriting"}
                 onRectSelected={onCreateMistake}
                 highlightRects={currentPairMistakes
-                  .filter((m) => m.pageIndex === selectedPageIndex)
+                  .filter((m) => {
+                    if (selectedRole === "with_handwriting") {
+                      return m.originalPageIndex === selectedPageIndex;
+                    }
+                    return typeof m.cleanPageIndex === "number"
+                      ? m.cleanPageIndex === selectedPageIndex
+                      : m.originalPageIndex === selectedPageIndex;
+                  })
                   .map((m) => m.bbox)}
               />
             )}
@@ -615,14 +720,10 @@ function WorkspaceView(props) {
         </div>
 
         <aside className="w-80 border-l border-slate-800 bg-slate-900/60 p-3 flex flex-col min-h-0">
-          <div className="text-xs font-semibold text-slate-200 mb-2">
-            本套卷错题（{currentPairMistakes.length}）
-          </div>
+          <div className="text-xs font-semibold text-slate-200 mb-2">本套卷错题（{currentPairMistakes.length}）</div>
           <div className="flex-1 overflow-auto space-y-2 pr-1">
             {currentPairMistakes.length === 0 && (
-              <div className="text-xs text-slate-500">
-                在 PDF 上拖拽框选错题区域即可创建错题卡。
-              </div>
+              <div className="text-xs text-slate-500">在错题版 PDF 上拖拽框选错题区域即可创建错题卡。</div>
             )}
             {currentPairMistakes
               .slice()
@@ -631,12 +732,12 @@ function WorkspaceView(props) {
                 <MistakeCard
                   key={m.id}
                   mistake={m}
-                  onUpdate={handleUpdateMistakeMeta}
+                  onUpdate={onUpdateMistakeMeta}
                   onDelete={onDeleteMistake}
                   onJump={() => {
                     setSelectedPairId(m.pairGroupId);
                     setSelectedRole("with_handwriting");
-                    setSelectedPageIndex(m.pageIndex);
+                    setSelectedPageIndex(m.originalPageIndex || 0);
                   }}
                 />
               ))}
@@ -654,16 +755,10 @@ function MistakeCard({ mistake, onUpdate, onDelete, onJump }) {
   return (
     <div className="border border-slate-800 rounded-lg p-2 bg-slate-900/80 flex flex-col gap-1">
       <div className="flex items-center justify-between gap-2">
-        <button
-          onClick={onJump}
-          className="text-xs font-semibold text-sky-300 hover:text-sky-100"
-        >
-          第 {mistake.pageIndex + 1} 页 · 错题
+        <button onClick={onJump} className="text-xs font-semibold text-sky-300 hover:text-sky-100">
+          第 {mistake.originalPageIndex + 1} 页 · 错题
         </button>
-        <button
-          onClick={() => onDelete(mistake.id)}
-          className="text-[10px] text-red-400 hover:text-red-200"
-        >
+        <button onClick={() => onDelete(mistake.id)} className="text-[10px] text-red-400 hover:text-red-200">
           删除
         </button>
       </div>
@@ -679,10 +774,7 @@ function MistakeCard({ mistake, onUpdate, onDelete, onJump }) {
             className="w-full bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-xs text-slate-100"
           />
         ) : (
-          <button
-            className="w-full text-left text-xs text-slate-200 break-words"
-            onClick={() => setEditingTitle(true)}
-          >
+          <button className="w-full text-left text-xs text-slate-200 break-words" onClick={() => setEditingTitle(true)}>
             {mistake.title || <span className="text-slate-500">点击添加简要描述</span>}
           </button>
         )}
@@ -705,9 +797,7 @@ function MistakeCard({ mistake, onUpdate, onDelete, onJump }) {
             className="w-full text-left text-[11px] text-slate-300 whitespace-pre-wrap break-words min-h-[1.5em]"
             onClick={() => setEditingNote(true)}
           >
-            {mistake.note || (
-              <span className="text-slate-500">点击填写错误原因、正确解法要点</span>
-            )}
+            {mistake.note || <span className="text-slate-500">点击填写错误原因、正确解法要点</span>}
           </button>
         )}
       </div>
@@ -719,7 +809,7 @@ function MistakeCard({ mistake, onUpdate, onDelete, onJump }) {
   );
 }
 
-function ReviewView({ current, index, total, onReview, documentMetas, getLoadedDoc }) {
+function ReviewView({ current, index, total, onReview, documents, getLoadedDoc }) {
   const [showOriginal, setShowOriginal] = useState(false);
 
   useEffect(() => setShowOriginal(false), [current?.id]);
@@ -727,40 +817,30 @@ function ReviewView({ current, index, total, onReview, documentMetas, getLoadedD
   if (!current || total === 0) {
     return (
       <div className="flex-1 flex items-center justify-center bg-slate-950">
-        <div className="text-xs text-slate-500">
-          暂无需要复习的错题。先在“错题管理”创建一些错题卡。
-        </div>
+        <div className="text-xs text-slate-500">暂无需要复习的错题。先在“错题管理”创建一些错题卡。</div>
       </div>
     );
   }
 
   const cleanMeta =
-    current.cleanFingerprint &&
-    documentMetas.find(
-      (d) => d.fingerprint === current.cleanFingerprint && d.role === "clean"
-    );
-  const withMeta = documentMetas.find(
-    (d) => d.fingerprint === current.originalFingerprint && d.role === "with_handwriting"
-  );
+    current.cleanDocumentId && documents.find((d) => d.id === current.cleanDocumentId && d.roleInPair === "clean");
+  const withMeta =
+    current.originalDocumentId &&
+    documents.find((d) => d.id === current.originalDocumentId && d.roleInPair === "with_handwriting");
 
   const preferClean = cleanMeta && !showOriginal;
   const activeMeta = preferClean ? cleanMeta : withMeta;
-  const loadedDoc =
-    activeMeta && getLoadedDoc(activeMeta.fingerprint, activeMeta.role);
+  const loadedDoc = activeMeta && getLoadedDoc(activeMeta.id);
 
   return (
     <div className="flex-1 flex flex-col bg-slate-950">
       <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800 bg-slate-900/70 text-xs">
-        <div className="text-slate-300">
-          今日复习进度：{index + 1} / {total}
-        </div>
+        <div className="text-slate-300">今日复习进度：{index + 1} / {total}</div>
         <div className="flex items-center gap-2 text-slate-400">
           <span>显示：</span>
           <button
             className={`px-2 py-0.5 rounded-full border ${
-              !showOriginal
-                ? "bg-emerald-600 border-emerald-400 text-white"
-                : "border-slate-700 text-slate-300 hover:border-slate-500"
+              !showOriginal ? "bg-emerald-600 border-emerald-400 text-white" : "border-slate-700 text-slate-300 hover:border-slate-500"
             }`}
             onClick={() => setShowOriginal(false)}
             disabled={!cleanMeta}
@@ -769,9 +849,7 @@ function ReviewView({ current, index, total, onReview, documentMetas, getLoadedD
           </button>
           <button
             className={`px-2 py-0.5 rounded-full border ${
-              showOriginal
-                ? "bg-sky-600 border-sky-400 text-white"
-                : "border-slate-700 text-slate-300 hover:border-slate-500"
+              showOriginal ? "bg-sky-600 border-sky-400 text-white" : "border-slate-700 text-slate-300 hover:border-slate-500"
             }`}
             onClick={() => setShowOriginal(true)}
             disabled={!withMeta}
@@ -783,22 +861,14 @@ function ReviewView({ current, index, total, onReview, documentMetas, getLoadedD
 
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 flex items-center justify-center">
-          {!activeMeta && (
-            <div className="text-xs text-slate-500">
-              当前错题关联的 PDF 未加载，请在“错题管理”中上传对应文档。
-            </div>
-          )}
+          {!activeMeta && <div className="text-xs text-slate-500">当前错题关联的 PDF 未加载，请在“错题管理”中上传对应文档。</div>}
           {activeMeta && !loadedDoc && (
-            <div className="text-xs text-slate-500">
-              {activeMeta.role === "clean"
-                ? "干净版 PDF 未加载。"
-                : "错题版 PDF 未加载。"}
-            </div>
+            <div className="text-xs text-slate-500">{activeMeta.roleInPair === "clean" ? "干净版 PDF 未加载。" : "错题版 PDF 未加载。"}</div>
           )}
           {activeMeta && loadedDoc && (
             <PdfPageViewer
               fileUrl={loadedDoc.url}
-              pageIndex={current.pageIndex}
+              pageIndex={preferClean ? current.cleanPageIndex || current.originalPageIndex : current.originalPageIndex}
               interactive={false}
               highlightRects={[current.bbox]}
             />
@@ -811,38 +881,22 @@ function ReviewView({ current, index, total, onReview, documentMetas, getLoadedD
             {current.title || <span className="text-slate-500">在错题管理中给这道题加一个标题。</span>}
           </div>
           <div className="text-[11px] text-slate-300 whitespace-pre-wrap bg-slate-950/70 border border-slate-800 rounded p-2 min-h-[80px]">
-            {current.note || (
-              <span className="text-slate-500">
-                解析 / 反思：错误原因、正确解法、易混点（在错题管理中填写）。
-              </span>
-            )}
+            {current.note || <span className="text-slate-500">解析 / 反思：错误原因、正确解法、易混点（在错题管理中填写）。</span>}
           </div>
 
           <div className="mt-auto">
             <div className="text-[11px] text-slate-400 mb-1">记忆情况：</div>
             <div className="grid grid-cols-2 gap-2 mb-2">
-              <button
-                onClick={() => onReview("again")}
-                className="px-2 py-1 rounded bg-red-600/80 hover:bg-red-600 text-xs text-white"
-              >
+              <button onClick={() => onReview("again")} className="px-2 py-1 rounded bg-red-600/80 hover:bg-red-600 text-xs text-white">
                 完全忘
               </button>
-              <button
-                onClick={() => onReview("hard")}
-                className="px-2 py-1 rounded bg-orange-600/80 hover:bg-orange-600 text-xs text-white"
-              >
+              <button onClick={() => onReview("hard")} className="px-2 py-1 rounded bg-orange-600/80 hover:bg-orange-600 text-xs text-white">
                 模糊
               </button>
-              <button
-                onClick={() => onReview("good")}
-                className="px-2 py-1 rounded bg-emerald-600/80 hover:bg-emerald-600 text-xs text-white"
-              >
+              <button onClick={() => onReview("good")} className="px-2 py-1 rounded bg-emerald-600/80 hover:bg-emerald-600 text-xs text-white">
                 基本记
               </button>
-              <button
-                onClick={() => onReview("easy")}
-                className="px-2 py-1 rounded bg-sky-600/80 hover:bg-sky-600 text-xs text-white"
-              >
+              <button onClick={() => onReview("easy")} className="px-2 py-1 rounded bg-sky-600/80 hover:bg-sky-600 text-xs text-white">
                 很熟
               </button>
             </div>
@@ -861,9 +915,7 @@ function DashboardView({ totalMistakeCount, dueCount, todayDoneCount }) {
         <StatCard label="当前待复习" value={dueCount} />
         <StatCard label="今日已复习" value={todayDoneCount} />
       </div>
-      <div className="text-[10px] text-slate-500">
-        仪表盘精简版：后续可以在这里加折线图、热力图等可视化。
-      </div>
+      <div className="text-[10px] text-slate-500">仪表盘精简版：后续可以在这里加折线图、热力图等可视化。</div>
     </div>
   );
 }
@@ -971,12 +1023,7 @@ function PdfPageViewer({ fileUrl, pageIndex, interactive, onRectSelected, highli
           {selection && (
             <div
               className="absolute border border-sky-400/80 bg-sky-500/10"
-              style={{
-                left: selection.x,
-                top: selection.y,
-                width: selection.width,
-                height: selection.height,
-              }}
+              style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }}
             />
           )}
           {highlightRects &&
